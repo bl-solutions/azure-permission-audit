@@ -2,84 +2,19 @@ import asyncio
 import logging
 import os
 import sys
-from enum import StrEnum
-from typing import Optional
 
 from azure.identity import DefaultAzureCredential
-from azure.mgmt.authorization import AuthorizationManagementClient
 from azure.mgmt.subscription import SubscriptionClient
 from dotenv import load_dotenv
-from msgraph import GraphServiceClient
-from neo4j import GraphDatabase, ManagedTransaction, Session
-from pydantic import BaseModel
+from neo4j import GraphDatabase, Session, ManagedTransaction
 
-
-class Node(StrEnum):
-    SUBSCRIPTION = "SUBSCRIPTION"
-    GROUP = "GROUP"
-    USER = "USER"
-
-
-class Relation(StrEnum):
-    # MEMBER_OF = "MEMBER_OF"
-    ASSIGNMENT = "ASSIGNMENT"
-
-
-class SubscriptionNode(BaseModel):
-    id: str
-    name: str = ""
-
-    @property
-    def clean_id(self) -> str:
-        return self.id.split("/")[-1]
-
-
-class GroupNode(BaseModel):
-    id: str
-    name: str = ""
-
-    async def fetch_name(self) -> None:
-        scopes = ["https://graph.microsoft.com/.default"]
-        client = GraphServiceClient(DefaultAzureCredential(), scopes)
-        result = await client.groups.by_group_id(self.id).get()
-        self.name = result.display_name
-
-
-class UserNode(BaseModel):
-    id: str
-    name: str = ""
-
-    async def fetch_name(self) -> None:
-        scopes = ["https://graph.microsoft.com/.default"]
-        client = GraphServiceClient(DefaultAzureCredential(), scopes)
-        result = await client.users.by_user_id(self.id).get()
-        self.name = result.display_name
-
-
-class Assignment(BaseModel):
-    id: str
-    subscription_id: str
-    role_id: str
-    principal_id: str
-    principal_type: str
-    role_name: str = ""
-
-    def fetch_role_name(self) -> None:
-        with AuthorizationManagementClient(
-            DefaultAzureCredential(), self.subscription_id
-        ) as client:
-            response = client.role_definitions.get_by_id(self.role_id)
-            self.role_name = response.role_name
-
-    @property
-    def principal_node_type(self) -> Optional[Node]:
-        match self.principal_type:
-            case "Group":
-                return Node.GROUP
-            case "User":
-                return Node.USER
-            case _:
-                return None
+from models import (
+    Assignment,
+    GroupPrincipal,
+    PrincipalType,
+    Subscription,
+    UserPrincipal,
+)
 
 
 async def main():
@@ -109,40 +44,75 @@ async def main():
             apply_constraints(session)
 
             logger.info("Listing Azure subscriptions...")
-            subscriptions = build_subscription_nodes()
+            subscriptions = fetch_subscriptions()
+
             logger.info("Recording Azure subscriptions...")
-            session.execute_write(record_subscriptions, subscriptions)
+            [s.merge_record(session) for s in subscriptions]
 
             logger.info("Listing role assignments...")
             assignments: list[Assignment] = list()
-            for subscription in subscriptions:
-                # To comment
-                # if len(assignments) > 0:
-                #     break
-                # End
-                assignments.extend(build_assignment_relations(subscription))
+            [assignments.extend(s.fetch_assignments()) for s in subscriptions]
 
             logger.info("Listing groups...")
             group_ids = unique(
-                [a.principal_id for a in assignments if a.principal_type == "Group"]
+                [
+                    a.principal_identifier
+                    for a in assignments
+                    if a.principal_type is PrincipalType.GROUP
+                ]
             )
-            groups = await build_group_nodes(group_ids)
+            groups = [GroupPrincipal(identifier=i) for i in group_ids]
             logger.info("Recording groups...")
-            session.execute_write(record_groups, groups)
+            [g.merge_record(session) for g in groups]
 
             logger.info("Listing users...")
             user_ids = unique(
-                [a.principal_id for a in assignments if a.principal_type == "User"]
+                [
+                    a.principal_identifier
+                    for a in assignments
+                    if a.principal_type is PrincipalType.USER
+                ]
             )
-            users = await build_user_nodes(user_ids)
+            users = [UserPrincipal(identifier=i) for i in user_ids]
             logger.info("Recording users...")
-            session.execute_write(record_users, users)
+            [u.merge_record(session) for u in users]
 
             logger.info("Recording role assignments...")
-            session.execute_write(record_assignments, assignments)
+            [a.merge_record(session) for a in assignments]
+
+            logger.info("Getting group members...")
+            for g in groups:
+                await record_group_members(session, g)
+
+            # Take a lot of time to fetch data based on
+            # - internet connection
+            # - msgraph response time
+            # - the number of requests
+            logger.info("Getting user names...")
+            [await u.fetch_name() for u in users]
+            logger.info("Updating user names...")
+            [u.update_record_name(session) for u in users]
+
+            logger.info("Getting group names...")
+            [await g.fetch_name() for g in groups]
+            logger.info("Updating group names...")
+            [g.update_record_name(session) for g in groups]
 
             logger.info("Getting role names...")
-            session.execute_write(update_role_name_records, assignments)
+            [a.fetch_role_name() for a in assignments]
+            logger.info("Updating role names...")
+            [a.update_record_role_name(session) for a in assignments]
+
+
+async def record_group_members(session: Session, group: GroupPrincipal) -> None:
+    logger.info("Get members of %s group" % group.identifier)
+    members = await group.fetch_members()
+    for member in members:
+        logger.debug("Recording member: %s" % member)
+        member.merge_record(session)
+        group.merge_member_record(session, member)
+        if isinstance(member, GroupPrincipal):
+            await record_group_members(session, member)
 
 
 def init_logger() -> logging.Logger:
@@ -170,10 +140,6 @@ def apply_constraints(session: Session) -> None:
         session.execute_write(add_user_constraint)
     except Exception as e:
         logger.debug("User constraint already applied")
-    # try:
-    #     session.execute_write(add_assignment_constraint)
-    # except Exception as e:
-    #     logger.debug("Assignment constraint already applied")
 
 
 def unique(items: list[str]) -> list[str]:
@@ -181,179 +147,26 @@ def unique(items: list[str]) -> list[str]:
     return list(items_set)
 
 
-def build_subscription_nodes() -> list[SubscriptionNode]:
+def fetch_subscriptions() -> list[Subscription]:
+    subscriptions: list[Subscription] = list()
     with SubscriptionClient(DefaultAzureCredential()) as client:
-        response = client.subscriptions.list()
-        subscriptions = list()
-        for subscription in response:
-            subscription_id = subscription.id
-            subscription_name = subscription.display_name
-            subscriptions.append(
-                SubscriptionNode(id=subscription_id, name=subscription_name)
-            )
+        for s in client.subscriptions.list():
+            subscriptions.append(Subscription(identifier=s.subscription_id, name=s.display_name))
     return subscriptions
 
 
-async def build_group_nodes(group_ids: list[str]) -> list[GroupNode]:
-    group_nodes = list()
-    for group_id in group_ids:
-        group_node = GroupNode(id=group_id)
-        await group_node.fetch_name()
-        group_nodes.append(group_node)
-    return group_nodes
-
-
-async def build_user_nodes(user_ids: list[str]) -> list[UserNode]:
-    user_nodes = list()
-    for user_id in user_ids:
-        user_node = UserNode(id=user_id)
-        await user_node.fetch_name()
-        user_nodes.append(user_node)
-    return user_nodes
-
-
-def build_assignment_relations(
-    subscription_node: SubscriptionNode,
-) -> list[Assignment]:
-    with AuthorizationManagementClient(
-        DefaultAzureCredential(), subscription_node.clean_id
-    ) as client:
-        logger.info("Listing assignments on %s" % subscription_node.id)
-        assignments = client.role_assignments.list_for_subscription()
-        assignment_relations = list()
-        for assignment in assignments:
-            if (
-                assignment.principal_type != "Group"
-                and assignment.principal_type != "User"
-            ):
-                continue
-            properties = {
-                "id": assignment.id,
-                "subscription_id": subscription_node.id,
-                "role_id": assignment.role_definition_id,
-                "principal_id": assignment.principal_id,
-                "principal_type": assignment.principal_type,
-            }
-            assignment_relation = Assignment(**properties)
-            assignment_relations.append(assignment_relation)
-    return assignment_relations
-
-
-def record_subscriptions(
-    tx: ManagedTransaction, subscriptions: list[SubscriptionNode]
-) -> None:
-    base_query = "MERGE (:%s {id: '%s', name: '%s'})"
-    query = ""
-    for subscription in subscriptions:
-        query = (
-            query
-            + "\n"
-            + base_query % (Node.SUBSCRIPTION, subscription.id, subscription.name)
-        )
-    logger.debug(query)
-    tx.run(query)
-
-
-def record_groups(tx: ManagedTransaction, groups: list[GroupNode]) -> None:
-    base_query = "MERGE (:%s {id: '%s', name: '%s'})"
-    query = ""
-    for group in groups:
-        query = query + "\n" + base_query % (Node.GROUP, group.id, group.name)
-    logger.debug(query)
-    tx.run(query)
-
-
-def record_users(tx: ManagedTransaction, users: list[UserNode]) -> None:
-    base_query = "MERGE (:%s {id: '%s', name: '%s'})"
-    query = ""
-    for user in users:
-        query = query + "\n" + base_query % (Node.USER, user.id, user.name)
-    logger.debug(query)
-    tx.run(query)
-
-
-def update_role_name_records(
-    tx: ManagedTransaction, assignments: list[Assignment]
-) -> None:
-    base_query = """
-        MATCH (:%s {id: '%s'})-[r:%s {id: '%s', role_id: '%s'}]-(:%s {id: '%s'})
-        SET r.role_name = '%s'
-    """
-    for assignment in assignments:
-        principal_node_type = assignment.principal_node_type
-        if not principal_node_type:
-            continue
-        assignment.fetch_role_name()
-
-        query = base_query % (
-            Node.SUBSCRIPTION,
-            assignment.subscription_id,
-            Relation.ASSIGNMENT,
-            assignment.id,
-            assignment.role_id,
-            principal_node_type,
-            assignment.principal_id,
-            assignment.role_name,
-        )
-        logger.debug(query)
-        tx.run(query)
-
-
-def record_assignments(tx: ManagedTransaction, assignments: list[Assignment]) -> None:
-    base_query = """
-        MATCH (s:%s {id: '%s'})
-        MATCH (n:%s {id: '%s'})
-        MERGE (s)-[r:%s {id: '%s', role_id: '%s'}]->(n)
-    """
-    query = ""
-    for assignment in assignments:
-        principal_node_type = assignment.principal_node_type
-        if not principal_node_type:
-            continue
-
-        query = base_query % (
-            Node.SUBSCRIPTION,
-            assignment.subscription_id,
-            principal_node_type,
-            assignment.principal_id,
-            Relation.ASSIGNMENT,
-            assignment.id,
-            assignment.role_id,
-        )
-
-        logger.debug(query)
-        tx.run(query)
-
-
 def add_subscription_constraint(tx: ManagedTransaction) -> None:
-    constraint = (
-        "CREATE CONSTRAINT subscription_id_unique FOR (n:%s) REQUIRE n.id IS UNIQUE"
-        % (Node.SUBSCRIPTION)
-    )
+    constraint = "CREATE CONSTRAINT subscription_id_unique FOR (n:SUBSCRIPTION) REQUIRE n.id IS UNIQUE"
     tx.run(constraint)
 
 
 def add_group_constraint(tx: ManagedTransaction) -> None:
-    constraint = (
-        "CREATE CONSTRAINT group_id_unique FOR (n:%s) REQUIRE n.id IS UNIQUE"
-        % (Node.GROUP)
-    )
+    constraint = "CREATE CONSTRAINT group_id_unique FOR (n:GROUP) REQUIRE n.id IS UNIQUE"
     tx.run(constraint)
 
 
 def add_user_constraint(tx: ManagedTransaction) -> None:
-    constraint = (
-        "CREATE CONSTRAINT user_id_unique FOR (n:%s) REQUIRE n.id IS UNIQUE"
-        % (Node.USER)
-    )
-    tx.run(constraint)
-
-
-def add_assignment_constraint(tx: ManagedTransaction) -> None:
-    constraint = (
-        "CREATE CONSTRAINT assignment_id_unique FOR [r:%s] REQUIRE r.id IS UNIQUE"
-        % (Node.USER)
-    )
+    constraint = "CREATE CONSTRAINT user_id_unique FOR (n:USER) REQUIRE n.id IS UNIQUE"
     tx.run(constraint)
 
 
