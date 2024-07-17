@@ -97,7 +97,8 @@ async def main():
             [u.update_record_name(session) for u in users]
 
             logger.info("Getting group names...")
-            [await g.fetch_name() for g in groups]
+            await asyncio.gather(*[group.fetch_name() for group in groups])
+
             logger.info("Updating group names...")
             [g.update_record_name(session) for g in groups]
 
