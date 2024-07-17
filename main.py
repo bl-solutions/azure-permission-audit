@@ -3,6 +3,7 @@ import concurrent.futures as cf
 import logging
 import os
 import sys
+import time
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.authorization import AuthorizationManagementClient
@@ -86,8 +87,7 @@ async def main():
             [a.merge_record(session) for a in assignments]
 
             logger.info("Getting group members...")
-            for g in groups:
-                await record_group_members(session, g)
+            await asyncio.gather(*[record_group_members(session, group) for group in groups])
 
             # Take a lot of time to fetch data based on
             # - internet connection
