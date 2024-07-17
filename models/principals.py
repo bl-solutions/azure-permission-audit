@@ -30,11 +30,14 @@ class PrincipalInterface(BaseModel):
 
     def merge_record(self, session: Session) -> None:
         """Record principal to the database"""
-        search = "MATCH (n:%s {id: '%s'}) RETURN n" % (self.principal_type.upper(), self.identifier)
+        search = "MATCH (n:%s {id: '%s'}) RETURN n" % (
+            self.principal_type.upper(),
+            self.identifier,
+        )
         query = "MERGE (:%s {id: '%s', name: '%s'})" % (
             self.principal_type.upper(),
             self.identifier,
-            self.name
+            self.name,
         )
         with session.begin_transaction() as tx:
             result = tx.run(search)
@@ -65,8 +68,11 @@ class UserPrincipal(PrincipalInterface):
     async def fetch_name(self) -> None:
         scopes = ["https://graph.microsoft.com/.default"]
         client = GraphServiceClient(DefaultAzureCredential(), scopes)
-        result = await client.users.by_user_id(self.identifier).get()
-        self.name = result.display_name
+        try:
+            result = await client.users.by_user_id(self.identifier).get()
+            self.name = result.display_name
+        except Exception as e:
+            return
 
 
 class GroupPrincipal(PrincipalInterface):
@@ -97,11 +103,19 @@ class GroupPrincipal(PrincipalInterface):
         return principals
 
     def merge_member_record(self, session: Session, member: PrincipalInterface) -> None:
-        query = query = """
+        query = query = (
+            """
             MATCH (g:%s {id: '%s'})
             MATCH (n:%s {id: '%s'})
             MERGE (n)-[:MEMBER_OF]->(g)
-        """ % (self.principal_type.upper(), self.identifier, member.principal_type.upper(), member.identifier)
+        """
+            % (
+                self.principal_type.upper(),
+                self.identifier,
+                member.principal_type.upper(),
+                member.identifier,
+            )
+        )
         with session.begin_transaction() as tx:
             tx.run(query)
             tx.commit()

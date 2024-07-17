@@ -13,13 +13,8 @@ from neo4j import GraphDatabase, ManagedTransaction, Session
 
 MAX_WORKERS = 4
 
-from models import (
-    Assignment,
-    GroupPrincipal,
-    PrincipalType,
-    Subscription,
-    UserPrincipal,
-)
+from models import (Assignment, GroupPrincipal, PrincipalType, Subscription,
+                    UserPrincipal)
 
 
 async def main():
@@ -87,14 +82,17 @@ async def main():
             [a.merge_record(session) for a in assignments]
 
             logger.info("Getting group members...")
-            await asyncio.gather(*[record_group_members(session, group) for group in groups])
+            await asyncio.gather(
+                *[record_group_members(session, group) for group in groups]
+            )
 
             # Take a lot of time to fetch data based on
             # - internet connection
             # - msgraph response time
             # - the number of requests
             logger.info("Getting user names...")
-            [await u.fetch_name() for u in users]
+            await asyncio.gather(*[user.fetch_name() for user in users])
+
             logger.info("Updating user names...")
             [u.update_record_name(session) for u in users]
 
