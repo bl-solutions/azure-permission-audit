@@ -1,12 +1,16 @@
 import asyncio
+import concurrent.futures as cf
 import logging
 import os
 import sys
 
 from azure.identity import DefaultAzureCredential
+from azure.mgmt.authorization import AuthorizationManagementClient
 from azure.mgmt.subscription import SubscriptionClient
 from dotenv import load_dotenv
-from neo4j import GraphDatabase, Session, ManagedTransaction
+from neo4j import GraphDatabase, ManagedTransaction, Session
+
+MAX_WORKERS = 4
 
 from models import (
     Assignment,
@@ -50,8 +54,9 @@ async def main():
             [s.merge_record(session) for s in subscriptions]
 
             logger.info("Listing role assignments...")
-            assignments: list[Assignment] = list()
-            [assignments.extend(s.fetch_assignments()) for s in subscriptions]
+            assignments = fetch_all_subscription_role_assignments(
+                [s.identifier for s in subscriptions]
+            )
 
             logger.info("Listing groups...")
             group_ids = unique(
@@ -151,7 +156,9 @@ def fetch_subscriptions() -> list[Subscription]:
     subscriptions: list[Subscription] = list()
     with SubscriptionClient(DefaultAzureCredential()) as client:
         for s in client.subscriptions.list():
-            subscriptions.append(Subscription(identifier=s.subscription_id, name=s.display_name))
+            subscriptions.append(
+                Subscription(identifier=s.subscription_id, name=s.display_name)
+            )
     return subscriptions
 
 
@@ -161,13 +168,44 @@ def add_subscription_constraint(tx: ManagedTransaction) -> None:
 
 
 def add_group_constraint(tx: ManagedTransaction) -> None:
-    constraint = "CREATE CONSTRAINT group_id_unique FOR (n:GROUP) REQUIRE n.id IS UNIQUE"
+    constraint = (
+        "CREATE CONSTRAINT group_id_unique FOR (n:GROUP) REQUIRE n.id IS UNIQUE"
+    )
     tx.run(constraint)
 
 
 def add_user_constraint(tx: ManagedTransaction) -> None:
     constraint = "CREATE CONSTRAINT user_id_unique FOR (n:USER) REQUIRE n.id IS UNIQUE"
     tx.run(constraint)
+
+
+def fetch_all_subscription_role_assignments(
+    subscription_ids: list[str],
+) -> list[Assignment]:
+    assignments: list[Assignment] = list()
+    with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = executor.map(fetch_subscription_role_assignments, subscription_ids)
+        [assignments.extend(r) for r in results]
+    return assignments
+
+
+def fetch_subscription_role_assignments(subscription_id: str) -> list[Assignment]:
+    logger.info("Get role assignments for subscription %s" % subscription_id)
+    with AuthorizationManagementClient(
+        DefaultAzureCredential(), subscription_id
+    ) as client:
+        response = client.role_assignments.list_for_subscription()
+        return [
+            Assignment(
+                identifier=assignment.id,
+                subscription_identifier=subscription_id,
+                principal_type=PrincipalType(assignment.principal_type),
+                principal_identifier=assignment.principal_id,
+                role_definition_identifier=assignment.role_definition_id,
+            )
+            for assignment in response
+            if assignment.principal_type.lower() in [t.lower() for t in PrincipalType]
+        ]
 
 
 if __name__ == "__main__":
