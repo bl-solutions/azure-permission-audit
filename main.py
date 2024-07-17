@@ -13,8 +13,13 @@ from neo4j import GraphDatabase, ManagedTransaction, Session
 
 MAX_WORKERS = 4
 
-from models import (Assignment, GroupPrincipal, PrincipalType, Subscription,
-                    UserPrincipal)
+from models import (
+    Assignment,
+    GroupPrincipal,
+    PrincipalType,
+    Subscription,
+    UserPrincipal,
+)
 
 
 async def main():
@@ -103,9 +108,20 @@ async def main():
             [g.update_record_name(session) for g in groups]
 
             logger.info("Getting role names...")
-            [a.fetch_role_name() for a in assignments]
+            fetch_all_assignment_role_names(assignments)
+
             logger.info("Updating role names...")
             [a.update_record_role_name(session) for a in assignments]
+
+
+def fetch_all_assignment_role_names(assignments: list[Assignment]) -> None:
+    with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for a in assignments:
+            executor.submit(fetch_assignment_role_name, a)
+
+
+def fetch_assignment_role_name(assignment: Assignment) -> None:
+    assignment.fetch_role_name()
 
 
 async def record_group_members(session: Session, group: GroupPrincipal) -> None:
